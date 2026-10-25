@@ -99,7 +99,7 @@ $\omega_{ref}$ 取相对角速度的一阶低通（时间常数 0.03 s）与底�
 **① 结构**：前馈是相对 $\theta$ 的谐波表，覆盖 $k=1,\dots,4$ 阶
 
 $$
-\tau_{per}\left(\theta\right)=\sum_{k=1}^{4}\left(a_k\sin k\theta+b_k\cos k\theta\right)
+\tau_{per}\left(\theta\right)=\sum_{k=1}^{4}\left(a_k\sin\left(k\theta\right)+b_k\cos\left(k\theta\right)\right)
 $$
 
 **② ATFF：系数在线自适应**。固定系数不可行：实测同一套系数在不同场次跑出

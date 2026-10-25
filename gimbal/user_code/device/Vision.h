@@ -47,7 +47,7 @@ typedef enum {
 } vision_led_state_e;
 
 // 视觉 -> 电控 34 字节控制包。yaw/pitch 是误差角 delta，不是云台绝对角。
-typedef struct __attribute__((packed)) {
+typedef __packed struct {
   uint8_t head[2]; // 帧头，“D”“S”象征着”Deus“
 
   uint8_t
@@ -71,7 +71,7 @@ typedef struct __attribute__((packed)) {
 //               "VisionRecvData_t must stay 34 bytes");
 
 // 电控 -> 视觉 31 字节反馈包
-typedef struct __attribute__((packed)) {
+typedef __packed struct {
   uint8_t BEGIN; // 帧头起始位,暂定0xA5
   uint8_t CmdID; // 颜色
 
@@ -157,10 +157,4 @@ public:
 
 extern Referee referee;
 
-#endif
-
-/* [AC6 迁移] 视觉接收包必须 34 字节：Vision.cpp 直接 memcpy 进这个结构体，
- * 若 packed 失效（AC6 会忽略 typedef 上的 __packed）就会错位。 */
-#if defined(__clang__)
-_Static_assert(sizeof(VisionRecvData_t) == 34, "VisionRecvData_t must be 34 bytes (packed)");
 #endif

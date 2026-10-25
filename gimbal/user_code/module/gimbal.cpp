@@ -52,7 +52,7 @@ const fp32 top_yaw_ff_max_torque_nm = 1.0f;
 const fp32 top_yaw_ff_filter_tau_s = 0.03f;
 const fp32 top_yaw_ff_error_hold_rad = 0.004f;
 const fp32 top_yaw_ff_error_backoff_rad = 0.02f;
-const fp32 top_yaw_ff_min_scale = 0.25f;
+const fp32 top_yaw_ff_min_scale = 1.0f;   /* 折扣按误差以 1x 调制前馈 0.2~0.45 N·m，与「确定性前馈」前提冲突 */
 
 /* ---- 周期前馈：小陀螺每转一次的扰动抑制（docs/periodic-disturbance-fix-idea.md 方案 A）
  * 相位参考用**云台相对角** theta_rel（不是时间）—— 自旋变速时频率自动跟随。
@@ -63,14 +63,36 @@ const fp32 top_yaw_ff_min_scale = 0.25f;
  */
 const fp32 top_periodic_ff_enable = 1.0f;
 const fp32 top_periodic_ff_max_torque_nm = 1.0f;
-const fp32 top_periodic_ff_fade_tau_s = 0.10f;
+const fp32 top_periodic_ff_fade_tau_s = 0.0f;   /* 标定值按「系数=施加力矩」反解，0.1 s 低通会让高阶偏差 40%+ */
 const fp32 top_periodic_ff_phase_offset_rad = 0.0f;
-const fp32 top_periodic_ff_a1 = -0.2596f;
-const fp32 top_periodic_ff_b1 = -0.0317f;
-const fp32 top_periodic_ff_a2 = +0.0000f;
-const fp32 top_periodic_ff_b2 = +0.0000f;
-const fp32 top_periodic_ff_a3 = +0.0000f;
-const fp32 top_periodic_ff_b3 = +0.0000f;
+/* 2026-10-25 现场标定（exp_2026-10-25_ff_coef_calib）：
+ *   1x D=0.3274 N·m∠-34.7° -> a1,b1；3x D=0.0456∠-130.7° -> a3,b3
+ *   2x 标定值实测把误差放大到 0.393 deg（基线 0.069），故归零，等在工作点上重新辨识。
+ *   v4 的 1x 相位偏 42°，2x/3x 原本无前馈。 */
+/* v7 候选：四阶周期前馈全部在线自适应；初值取 v6 实测收敛值 */
+const fp32 top_periodic_ff_a1 = -0.2613f;
+const fp32 top_periodic_ff_b1 = +0.1626f;
+const fp32 top_periodic_ff_a2 = -0.0176f;
+const fp32 top_periodic_ff_b2 = +0.0231f;
+const fp32 top_periodic_ff_a3 = +0.0095f;
+const fp32 top_periodic_ff_b3 = +0.0296f;
+
+/* ==== 四阶在线自适应 + 软启动斜坡（test-only）==== */
+const fp32 top_ff_adapt_gamma = 0.15f;
+const fp32 top_ff_adapt_g_mag[4] = {3.34f, 4.36f, 3.22f, 2.80f};
+const fp32 top_ff_adapt_g_phase[4] = {-2.857f, 2.373f, 1.410f, 0.366f};
+const fp32 top_ff_adapt_limit_nm[4] = {0.6f, 0.6f, 0.6f, 0.15f};
+const fp32 top_ff_adapt_min_err_deg = 0.02f;
+const fp32 top_ff_adapt_guard_err_rad = 0.05f;
+const fp32 top_ff_ramp_s = 0.15f;
+fp32 top_ff_dyn_a[4] = {-0.2613f, -0.0176f, +0.0095f, 0.0f};
+fp32 top_ff_dyn_b[4] = {+0.1626f, +0.0231f, +0.0296f, 0.0f};
+fp32 top_ff_ramp_gain = 0.0f;
+static fp32 top_ff_adapt_acc_th = 0.0f;
+static fp32 top_ff_adapt_acc_s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+static fp32 top_ff_adapt_acc_c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+static fp32 top_ff_adapt_prev_th = 0.0f;
+static uint8_t top_ff_adapt_init = 0U;
 static uint8_t yaw_bias_hold_latched = 0U;
 static uint8_t vision_yaw_settled_latched = 0U;
 static uint8_t vision_yaw_settled_cycles = 0U;
@@ -198,6 +220,80 @@ static fp32 get_top_yaw_ff_error_scale(fp32 relative_omega_radps, fp32 gyro_erro
                (top_yaw_ff_error_backoff_rad - top_yaw_ff_error_hold_rad);
 }
 
+/* 四阶残差归零：每累计一个整转，按各阶复残差修正 (a_k,b_k) */
+static void update_top_ff_adapt(fp32 th, fp32 err_rad, fp32 rel_omega)
+{
+    const fp32 two_pi = 6.28318530718f;
+    if (abs_fp32(err_rad) > top_ff_adapt_guard_err_rad || rel_omega < 4.0f)
+    {
+        top_ff_adapt_acc_th = 0.0f;
+        for (uint8_t k = 0U; k < 4U; ++k)
+        {
+            top_ff_adapt_acc_s[k] = 0.0f;
+            top_ff_adapt_acc_c[k] = 0.0f;
+        }
+        top_ff_adapt_init = 0U;
+        return;
+    }
+    if (top_ff_adapt_init == 0U)
+    {
+        top_ff_adapt_prev_th = th;
+        top_ff_adapt_init = 1U;
+        return;
+    }
+    const fp32 dth = rad_format(th - top_ff_adapt_prev_th);
+    top_ff_adapt_prev_th = th;
+    const fp32 w = abs_fp32(dth);
+    if (w < 1e-6f)
+    {
+        return;
+    }
+    const fp32 s1 = sin(th);
+    const fp32 c1 = cos(th);
+    const fp32 s2 = 2.0f * s1 * c1;
+    const fp32 c2 = c1 * c1 - s1 * s1;
+    const fp32 s3 = s2 * c1 + c2 * s1;
+    const fp32 c3 = c2 * c1 - s2 * s1;
+    const fp32 s4 = 2.0f * s2 * c2;
+    const fp32 c4 = c2 * c2 - s2 * s2;
+    const fp32 sk[4] = {s1, s2, s3, s4};
+    const fp32 ck[4] = {c1, c2, c3, c4};
+
+    top_ff_adapt_acc_th += w;
+    for (uint8_t k = 0U; k < 4U; ++k)
+    {
+        top_ff_adapt_acc_s[k] += err_rad * sk[k] * w;
+        top_ff_adapt_acc_c[k] += err_rad * ck[k] * w;
+    }
+    if (top_ff_adapt_acc_th < two_pi)
+    {
+        return;
+    }
+    const fp32 inv_th = 2.0f * 57.2957795f / top_ff_adapt_acc_th;
+    for (uint8_t k = 0U; k < 4U; ++k)
+    {
+        const fp32 es_deg = top_ff_adapt_acc_s[k] * inv_th;
+        const fp32 ec_deg = top_ff_adapt_acc_c[k] * inv_th;
+        top_ff_adapt_acc_s[k] = 0.0f;
+        top_ff_adapt_acc_c[k] = 0.0f;
+        if ((es_deg * es_deg + ec_deg * ec_deg) <
+            (top_ff_adapt_min_err_deg * top_ff_adapt_min_err_deg))
+        {
+            continue;
+        }
+        const fp32 inv_g = top_ff_adapt_gamma / top_ff_adapt_g_mag[k];
+        const fp32 kr = -inv_g * cos(top_ff_adapt_g_phase[k]);
+        const fp32 ki = inv_g * sin(top_ff_adapt_g_phase[k]);
+        top_ff_dyn_a[k] += kr * es_deg - ki * ec_deg;
+        top_ff_dyn_b[k] += kr * ec_deg + ki * es_deg;
+        top_ff_dyn_a[k] = fp32_constrain(top_ff_dyn_a[k], -top_ff_adapt_limit_nm[k],
+                                         top_ff_adapt_limit_nm[k]);
+        top_ff_dyn_b[k] = fp32_constrain(top_ff_dyn_b[k], -top_ff_adapt_limit_nm[k],
+                                         top_ff_adapt_limit_nm[k]);
+    }
+    top_ff_adapt_acc_th = 0.0f;
+}
+
 static fp32 get_top_yaw_ff_torque(fp32 relative_omega_radps, fp32 gyro_error_rad)
 {
     fp32 omega_ff = relative_omega_radps;
@@ -262,9 +358,12 @@ static fp32 get_top_periodic_ff_torque(fp32 relative_angle_rad, fp32 relative_om
         const fp32 s3 = s2 * c1 + c2 * s1;
         const fp32 c3 = c2 * c1 - s2 * s1;
 
-        target = top_periodic_ff_a1 * s1 + top_periodic_ff_b1 * c1 +
-                 top_periodic_ff_a2 * s2 + top_periodic_ff_b2 * c2 +
-                 top_periodic_ff_a3 * s3 + top_periodic_ff_b3 * c3;
+        const fp32 s4 = 2.0f * s2 * c2;
+        const fp32 c4 = c2 * c2 - s2 * s2;
+        target = top_ff_dyn_a[0] * s1 + top_ff_dyn_b[0] * c1 +
+                 top_ff_dyn_a[1] * s2 + top_ff_dyn_b[1] * c2 +
+                 top_ff_dyn_a[2] * s3 + top_ff_dyn_b[2] * c3 +
+                 top_ff_dyn_a[3] * s4 + top_ff_dyn_b[3] * c4;
         target = fp32_constrain(target, -top_periodic_ff_max_torque_nm,
                                 top_periodic_ff_max_torque_nm);
     }
@@ -1327,8 +1426,11 @@ void Gimbal::solve()
         // IMU 角度外环直接输出速度目标，不再转换成编码器目标。
         // 将历史量映射到当前角度附近，避免跨 +/-pi 时 D/F 项跳变。
         const fp32 gyro_error = rad_format(gimbal_yaw_motor.gyro_angle_set - gimbal_yaw_motor.gyro_angle);
-        const fp32 top_hold_error = 0.008f +
-            top_yaw_sector_weight * (TOP_YAW_SECTOR_HOLD_ERROR_RAD - 0.008f);
+        /* 2026-10-26 v4：保持死区 0.008 -> 0.002 rad。
+         * 依据：真机 v3 采集里 1.5~3 Hz 抖动占 41.5% 方差，而 0.008 rad 死区使环路 66% 时间
+         * 不动作；扇区增强区一直用 0.0015 rad 且无自激，故把基准收紧到同一量级。 */
+        const fp32 top_hold_error = 0.002f +
+            top_yaw_sector_weight * (TOP_YAW_SECTOR_HOLD_ERROR_RAD - 0.002f);
         if (gimbal_mode == GIMBAL_TOP &&
         vision_mpc_feedforward_active() == 0U &&
         abs_fp32(gyro_error) <= top_hold_error)
@@ -1427,12 +1529,25 @@ void Gimbal::output()
 #else
         reset_top_yaw_ff_filter_state();
 #endif
-        /* 周期前馈：与常值/单正弦前馈叠加；表全 0 时与旧行为等效 */
+        /* 四阶在线自适应：每转按残差修正 (a_k,b_k) */
+        update_top_ff_adapt(chassis.chassis_relative_angle, yaw_control_error,
+                            top_tune_debug.relative_omega);
         final_yaw_tor += get_top_periodic_ff_torque(chassis.chassis_relative_angle,
                                                    top_tune_debug.relative_omega);
+        /* 软启动斜坡：进 TOP 后 0.15 s 内把整段前馈线性拉起，消除力矩阶跃 */
+        if (top_ff_ramp_gain < 1.0f)
+        {
+            top_ff_ramp_gain += GIMBAL_CONTROL_TIME / top_ff_ramp_s;
+            if (top_ff_ramp_gain > 1.0f)
+            {
+                top_ff_ramp_gain = 1.0f;
+            }
+        }
+        final_yaw_tor *= top_ff_ramp_gain;
     }
     else
     {
+        top_ff_ramp_gain = 0.0f;
         reset_top_yaw_ff_filter_state();
         reset_top_periodic_ff_state();
     }

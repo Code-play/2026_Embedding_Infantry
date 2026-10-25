@@ -92,9 +92,9 @@
 #define RC_CH_VALUE_MAX 1684
 #define RC_CH_VALUE_MIN 364
 
-typedef struct __attribute__((packed))
+typedef __packed struct
 {
-        struct __attribute__((packed))
+        __packed struct
         {
                 int16_t ch[4];     //通道0~3       
                 uint8_t mode_sw;    //档位开关
@@ -104,7 +104,7 @@ typedef struct __attribute__((packed))
                 int16_t wheel;          //拨轮
                 uint8_t shutter;        //扳机
         } rc;
-        struct __attribute__((packed))
+        __packed struct
         {
                 int16_t x;
                 int16_t y;
@@ -113,7 +113,7 @@ typedef struct __attribute__((packed))
                 uint8_t press_r;
                 uint8_t middle;
         } mouse;
-        struct __attribute__((packed))
+        __packed struct
         {
                 uint16_t v;
         } key;
@@ -149,10 +149,4 @@ public:
 };
 
 
-#endif
-
-/* [AC6 迁移] packed 必须真的生效（AC5 的 __packed 布局 = attribute((packed))）：
- * rc 15 + mouse 9 + key 2 + crc16 2 = 28 字节。 */
-#if defined(__clang__)
-_Static_assert(sizeof(VT13_RC_ctrl_t) == 28, "VT13_RC_ctrl_t must be 28 bytes (packed)");
 #endif

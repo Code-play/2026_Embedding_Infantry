@@ -119,8 +119,18 @@ uint32_t fdcanx_receive(FDCAN_HandleTypeDef *hfdcan, uint8_t *buf)
 ************************************************************************
 **/
 
-/* [AC6 迁移补丁] 删掉三个空的弱回调兜底实现（否则链接器会选中空实现，
- * CAN 接收回调永不执行；等价于 fw/params_whitelist.json 的 weak_callback_* 补丁）。 */
+__weak void fdcan1_rx_callback(void){
+
+}
+
+__weak void fdcan2_rx_callback(void)
+{
+
+}
+
+__weak void fdcan3_rx_callback(void){
+	
+}
 
 
 

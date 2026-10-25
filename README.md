@@ -1,67 +1,221 @@
-# 2026_Embedding_Infantry · 步兵固件（实机）
+# 2026_Embedding_Infantry · 步兵固件控制算法
 
-浙江工业大学 DEUS 战队 2026 赛季步兵机器人固件源码与工程。
+本文只讲这份固件里的控制算法思路：云台双轴、底盘、发射机构，以及它们之间的耦合处理。
+仓库内另有完整工程与 hex，构建与烧录细节不在这里展开。
 
-本仓库**只包含实机固件**：CubeMX/Keil 工程、用户代码（`user_code/`）与已编译的烧录 hex。
-不含仿真、建模、自动调参等工具链代码。
+## 一、总体结构
 
-## 当前版本：v3 = `2026-10-26_top_dc_fix`
+四个实时任务，统一由 FreeRTOS 调度：
 
-- **改动**：`gimbal/user_code/module/gimbal.h` 中 `YAW_IMU_RATE_PID_MAX_IOUT` 由 `1000` 改为 `2500`
-  （小陀螺 TOP 模式下 yaw 角速度内环的积分上限 $1.0\to2.5$ N·m）。
-- **原因**：底盘自转 7 rad/s 时 yaw 轴的保持负载约 1.2 N·m，旧上限 1.0 N·m 导致内环积分长期饱和
-  （真机采集里 61% 的采样顶在上限），力矩缺口只能由内环 P 项承担 → 需要约 0.18 rad/s 的持续速率误差；
-  而外环积分又会被 TOP 保持死区分支 `align_state_to_current()` 反复清零，只能以 P 项输出该速率误差
-  → 稳态角度误差约 $0.015$ rad（$0.85^\circ$）。
-- 其余代码与上一版（周期前馈 + 安全补丁）一致。
-
-真机验证见 `MANIFEST.md`。
-
-## 目录结构
-
-```
-gimbal/                  Keil / CubeMX 工程
-  Core/                  CubeMX 生成的初始化与中断
-  Drivers/               STM32H7 HAL 驱动
-  Middlewares/           FreeRTOS 等中间件
-  MDK-ARM/               Keil 工程文件（gimbal.uvprojx / gimbal.uvoptx / startup）
-  user_code/             用户代码（算法 / 应用任务 / 设备 / 通信协议）
-  gimbal.ioc             CubeMX 工程配置
-hex/gimbal.hex           已编译的 v3 固件，可直接烧录
-build/                   AC6（armclang）构建工具
-  build_ac6.ps1          一键构建：复制工程 → AC6 迁移补丁 → uVision 编译
-  apply_ac6_patches.py   AC6 迁移补丁（weak 回调 / __packed / 结构体静态断言）
-  gimbal.uvprojx         AC6 迁移后的 Keil 工程
-  FreeRTOS_GCC_ARM_CM4F  FreeRTOS 的 GCC/ARM_CM4F 移植层
-```
-
-## 构建
-
-方式一（原始工程，AC5）：Keil MDK 打开 `gimbal/MDK-ARM/gimbal.uvprojx` 直接编译。
-
-方式二（AC6，本仓库 hex 的构建方式）：Keil MDK ≥ 5.37（AC6.24）+ Python 3.11：
-
-```powershell
-pwsh -File build\build_ac6.ps1 `
-  -Tree   <仓库路径>\gimbal `
-  -UserCode <仓库路径>\gimbal\user_code `
-  -OutDir <输出目录>
-```
-
-## 烧录
-
-```powershell
-python -m pyocd flash -t stm32h723xx -O connect_mode=attach hex\gimbal.hex
-```
-
-- hex 大小：348323 字节
-- hex SHA256：`739283C62FA5921B73EA535490BD33F81FB77CC4515F1B43018BFA61929488E5`
-
-烧录后建议做一次只读冒烟：`uwTick` 递增、`CFSR = HFSR = 0`、`YAW_IMU_RATE_PID_MAX_IOUT = 2500`（RAM 中对应 PID 的 `max_iout` 为 2.5）。
-
-## 历史版本
-
-| 版本 | 标签 | 说明 |
+| 任务 | 周期 | 职责 |
 |---|---|---|
-| v2 | `2026-10-24_periodic_ff_v2` | TOP yaw 周期前馈（1 次谐波 $\cos(\theta+\varphi)$ 拟合，系数按真机标定）+ 安全补丁（无力档清空速度目标、遥控失联超时强制无力） |
-| v3 | `2026-10-26_top_dc_fix` | 本次：内环积分上限 1000 → 2500，消除小陀螺稳态静差 |
+| communicate | 2 ms | 遥控器 / 视觉 / 裁判系统收帧，CAN 收发 |
+| gimbal | 2 ms | 云台双轴控制与输出 |
+| chassis | 2 ms | 底盘解算、功率控制与输出 |
+| shoot | 1 ms | 摩擦轮、拨盘、热量闭环 |
+
+三个模式机互相独立：
+
+- 云台：`TOP`（跟随底盘、小陀螺）、`FREE`（绝对朝向）、`ZERO_FORCE`（无力）；
+- 底盘：`TOP`（小陀螺）、`FREE`（不跟角度）、`ZERO_FORCE`；
+- 发射：上锁 / 解锁 / 开火。
+
+## 二、云台 yaw：串级 + 前馈
+
+### 2.1 为什么内环用 IMU 世界角速度
+
+yaw 有两级串联：
+
+$$
+\omega^{set} = \mathrm{PID}_{\psi}\!\left(\psi^{set}-\psi\right),
+\qquad
+\tau = \mathrm{PID}_{\omega}\!\left(\omega^{set}-\omega_{world}\right)\cdot 10^{-3}
+$$
+
+外环 $\mathrm{PID}_{\psi}$（$K_p=11$、$K_i=0.003$、$k_f=400$）以 IMU 绝对 yaw 角为反馈，输出角速度目标；
+内环 $\mathrm{PID}_{\omega}$（$K_p=800$、$K_i=12$、$K_d=50$、$k_f=100$）的反馈是**由 IMU 欧拉角换算的世界 yaw 角速度**，
+而不是电机回传的关节速度。原因：大陀螺时底盘以 7 rad/s 自转，电机关节速度里混着自转量，
+用它做反馈会把自转误当成误差；用世界角速度后，内环只需把"云台相对大地的角速度"压到目标值，
+自然解耦底盘自转。
+
+内环输出经 `0.001 N·m/单位` 缩放成力矩，叠加前馈后限幅 $\pm4$ N·m，再以达妙电机的
+MIT 模式下发（位置环/速度环增益 $k_p=0$，只保留力矩与阻尼项 $k_d$）。
+
+### 2.2 TOP 模式的保持死区与积分清零
+
+TOP 模式下角度环设了一个保持死区：当
+
+$$
+\left|e_\psi\right| \le \delta_{hold}
+\quad\Rightarrow\quad
+\omega^{set}=0,\ \text{外环积分清零}
+$$
+
+$\delta_{hold}=0.008$ rad，进入扇区增强区时缩到 $0.0015$ rad。
+
+思路：自转状态下，底盘每转一圈都会给 yaw 轴带来周期扰动，死区让环路在误差很小时"不动"，
+从而避免把扰动当成误差、把噪声放大成力矩抖动。代价是外环积分会周期性被清零，
+稳态只能靠 P 项出力——这也决定了积分限幅必须留足（见 2.4）。
+
+### 2.3 扇区增益调度
+
+线缆、结构在某一段相对角度上会附加摩擦与柔度，因此按**编码器相对角** $\theta_{enc}$ 做增益调度：
+在区间 $[0.6,\,-2.9]$ rad（跨 $\pm\pi$ 连续）内，权重
+
+$$
+w = \mathrm{smoothstep}\!\left(\mathrm{clip}\!\left(\frac{h+\beta-\left|\theta_{enc}-\theta_c\right|}{\beta}\right)\right),
+\qquad w\in[0,1]
+$$
+
+并对 $w$ 做 20 ms 时间斜率限制（避免进入 TOP 时恰好落在增强区造成增益跳变）。增强量：
+
+$$
+K_{p,\psi}\to K_{p,\psi}(1+0.25w),\qquad
+K_{p,\omega}\to K_{p,\omega}(1+0.60w),\qquad
+\delta_{hold}:\ 0.008\to0.0015\ \text{rad}
+$$
+
+只放大 P 项、共用同一套积分状态，避免"双套 PID 切换"带来的冲击。
+
+### 2.4 常值速度前馈与误差回退
+
+自转保持所需力矩随转速增加，因此给一个随速度增长的前馈：
+
+$$
+\tau_{ff}=\mathrm{sat}_{[0,1.0]}\Big(0.65+0.0125\left(\omega_{ref}-10\right)\Big)\cdot s_e
+$$
+
+$\omega_{ref}=\max\left(\mathrm{LPF}_{0.03}\left(\dot\theta_{rel}\right),\ \omega^{set}_{chassis}\right)$，
+$\dot\theta_{rel}<1$ rad/s 时关闭。关键在回退系数 $s_e$：
+
+- 若 $\dot\theta_{rel}\cdot e_\psi\ge0$（误差方向与自转同向，说明补偿不足）→ $s_e=1$；
+- 若方向相反（前馈在把误差推大）→ 误差超过 0.004 rad 后 $s_e$ 从 1 线性降到 0.25，
+  0.02 rad 处只保留 1/4。
+
+这条回退是为了防止前馈形成正反馈：前馈过大时误差方向会翻转，回退把补偿压回去。
+
+### 2.5 周期前馈
+
+底盘自转会在 yaw 轴上产生与相对角 $\theta_{rel}$ 锁相的周期力矩，用谐波表补偿：
+
+$$
+\tau_{per}(\theta)=\sum_{k=1}^{3}\left(a_k\sin k\theta+b_k\cos k\theta\right),
+\qquad \theta=\theta_{rel}+\varphi_0
+$$
+
+当前只启用 1 次谐波：$a_1=-0.2596$、$b_1=-0.0317$ N·m（2、3 次系数为 0，
+$k\ge2$ 用倍角恒等式展开以省三角函数）。$\dot\theta_{rel}>1$ rad/s 时启用，限幅 $\pm1$ N·m，
+一阶淡入时间常数 0.1 s。
+
+### 2.6 阻尼项
+
+yaw 的 MIT 阻尼系数 $k_d$ 分场景：
+
+- 手动：$k_d=0.08$；
+- 视觉接管：远距离 0.04、近距离 0.30，按误差在 0.005~0.05 rad 之间平滑切换。
+
+近距离大阻尼是为了抑制视觉闭环下的超调。
+
+## 三、云台 pitch
+
+pitch 是"P 主导 + 重力前馈 + 摩擦补偿"的串级：
+
+$$
+\tau_p=\mathrm{PID}_{\omega_p}\Big(\mathrm{PID}_{\theta_p}\big(e_p\big)\Big)
++ \tau_g+\tau_{fric}
+$$
+
+- 外环 $\mathrm{PID}_{\theta_p}$：$K_p=30$、$K_i=0.01$、$k_f=200$、积分限幅 0（实际为 P 项 + 目标速率前馈）；
+- 内环 $\mathrm{PID}_{\omega_p}$：$K_p=1000$、$K_d=10$；
+- 重力前馈：
+
+$$
+\tau_g=-1.55\cos\theta_{dev},\qquad
+\theta_{dev}=\theta_p^{set}-\theta_{pitch}^{horiz}
+$$
+
+即按"炮管与水平面的夹角"给重力矩做投影，俯仰越低补偿越大；
+- 摩擦补偿：$\pm0.15$ N·m 的库仑项，速度死区 0.05 rad/s，静止时不补偿；
+- 限位软保护：超过俯仰上下限且力矩继续往外推时，把该轴力矩清零，靠机械限位兜底；
+- 总力矩同样限幅 $\pm4$ N·m，MIT 下发电机力矩。
+
+## 四、底盘
+
+### 4.1 运动学反解
+
+四轮按 45° 全向轮（与麦克纳姆轮共用同一套反解）解算：
+
+$$
+\omega_i=\frac{\sqrt{2}\left(\pm v_x\pm v_y\right)-L\,\omega_z}{R},
+\qquad i=1\dots4
+$$
+
+$R=0.076$ m（固件标定值，已把全向轮的 $\sqrt{2}$ 等效计入）、$L=0.185$ m；
+正负号按轮位交替。每轮再走速度环（M3508 + C620 电流环）。
+
+### 4.2 小陀螺的坐标变换与延时前馈
+
+TOP 模式下底盘持续自转，操作手给的前后左右是在**云台坐标系**里的，因此先旋转到车体系：
+
+$$
+v_x = \cos\theta_{rel}\,v_x^{rc}+\sin\theta_{rel}\,v_y^{rc},
+\qquad
+v_y = -\left(-\sin\theta_{rel}\,v_x^{rc}+\cos\theta_{rel}\,v_y^{rc}\right)
+$$
+
+$\theta_{rel}$ 是云台与底盘的相对角。因为电控与机械都有延迟（实测 45~65 ms 量级），
+再按相对角速度叠加一个角度前馈 $\Delta\theta$，让"前进方向始终是云台朝向"。
+
+自转指令由状态机给：常速 7 rad/s；阶梯变速档（受击后分段提速）默认关闭。
+
+### 4.3 功率闭环
+
+裁判系统给的是功率上限，因此底盘做功率估计与缩放：
+
+$$
+P_j=\left(K_0 I_j\omega_j+K_1\omega_j^2+K_2 I_j^2+A\right)\times1.25
+$$
+
+预算取 $120-12$ W（留 12 W 裕度），用二分法求缩放系数 $\eta\in[0,1]$：
+
+$$
+\sum_{j=1}^{4}P_j\left(I_j\eta,\ \omega_j\right)\le P_{budget}
+$$
+
+$\eta$ 同时作用于四轮目标电流，保证超功率时整体等比例削减，而不是让某一轮先饱和。
+
+## 五、发射机构
+
+- **摩擦轮**：左右各一个速度环，$K_p=2000$、$K_i=0.8$、$K_d=2$，目标转速按弹速需求比例缩放；
+- **拨盘**：速度环 $K_p=2000$、$K_i=0.5$，输出限幅 4000；
+- **卡弹检测**：转速低于 1 rad/s 且电流高于 3000 持续 80 ms 判为卡弹 → 反转 100 ms →
+  停 40 ms 再前拨，最多重试 3 次，正常拨弹一段时间后计数复位；
+- **热量闭环**：本地积分（每发 +12，按冷却速率衰减）与裁判系统实测热量取较大值，
+  低于"上限 − 裕度 − 提前量"才允许开火，重新上膛阈值留 50 的滞回，避免在阈值附近抖动。
+
+## 六、安全与模式处理
+
+- **无力档显式清零**：`ZERO_FORCE` 下必须把 $v_x,v_y,\omega_z$ 目标清零，否则底盘反解会沿用上一帧目标（"下档不停"）；
+- **遥控失联**：VT13 超过 150 ms 没有新帧 → 强制进入无力档；
+- **模式切换清积分**：切换模式时对相关 PID 做 `align_state_to_current()`，避免切换瞬间积分项踢动；
+- **云台目标限幅**：pitch 的 IMU 角目标限制在 $[-0.40,0.30]$ rad，
+  超出限位且力矩继续外推时力矩清零。
+
+## 七、关键参数一览
+
+| 项 | 值 |
+|---|---|
+| yaw 角度环 | $K_p=11$, $K_i=0.003$, $k_f=400$, 积分限幅 800 |
+| yaw 角速度环 | $K_p=800$, $K_i=12$, $K_d=50$, $k_f=100$, 积分限幅 2500, 输出限幅 15000 |
+| yaw 力矩限幅 | $\pm4$ N·m |
+| yaw MIT 阻尼 | 手动 0.08；视觉 0.04~0.30 |
+| TOP 常值前馈 | $0.65+0.0125(\omega_{ref}-10)$，上限 1.0 N·m |
+| TOP 周期前馈 | $a_1=-0.2596$, $b_1=-0.0317$ N·m，上限 1.0 N·m |
+| 扇区增强 | 角度 $K_p\times1.25$、速率 $K_p\times1.60$，死区 $0.008\to0.0015$ rad |
+| pitch 角度环 / 速度环 | $K_p=30$ / $K_p=1000$, $K_d=10$ |
+| pitch 重力前馈 | $-1.55\cos\theta_{dev}$ N·m |
+| pitch 摩擦补偿 | $\pm0.15$ N·m，速度死区 0.05 rad/s |
+| 底盘反解 | $R=0.076$ m, $L=0.185$ m, 全向轮 $\sqrt{2}$ |
+| 功率预算 | $120-12$ W |
+| 摩擦轮 / 拨盘 | $K_p=2000$, $K_i=0.8/0.5$ |
+| 小陀螺自转 | 7 rad/s |

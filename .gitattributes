@@ -1,0 +1,6 @@
+# 二进制文件不要做行尾转换（否则 hex 的 CRLF 会被改成 LF，字节与烧录归档不一致）
+*.hex binary
+*.bin binary
+*.lib binary
+*.a binary
+*.axf binary

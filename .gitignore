@@ -1,0 +1,21 @@
+# Keil 构建产物
+gimbal/MDK-ARM/gimbal/
+gimbal/MDK-ARM/Objects/
+gimbal/MDK-ARM/Listings/
+gimbal/MDK-ARM/DebugConfig/
+*.uvguix.*
+*.o
+*.d
+*.crf
+*.axf
+*.map
+*.lst
+*.lnp
+*.dep
+*.build_log.htm
+*.bak
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.vscode/

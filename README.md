@@ -59,7 +59,7 @@ $$
 在区间 $0.6\ \mathrm{rad}$ 到 $-2.9\ \mathrm{rad}$（跨正负 $\pi$ 连续）内定义权重
 
 $$
-w = \mathrm{smoothstep}\left(\mathrm{clip}\left(\frac{h+\beta-\left|\theta_{enc}-\theta_c\right|}{\beta},\,0,\,1\right)\right),
+w = \mathrm{smoothstep}\left(\mathrm{clip}\left(\frac{h+\beta-\left|\theta_{enc}-\theta_c\right|}{\beta},0,1\right)\right),
 \qquad w\in\left[0,1\right]
 $$
 
@@ -108,9 +108,9 @@ $1\times$ 残差 $0.059\sim0.153^{\circ}$、相位转过 $150^{\circ}$（线缆�
 ATFF 每累计一个整转（即 $\left|\mathrm{d}\theta\right|=2\pi$）做一次残差归零：
 
 $$
-z_k \leftarrow z_k-\gamma\,\frac{e_k}{G_k},
+z_k \leftarrow z_k-\gamma\frac{e_k}{G_k},
 \qquad
-z_k=a_k+\mathrm{j}\,b_k
+z_k=a_k+\mathrm{j}b_k
 $$
 
 - $e_k$：该周期按 $\theta$ 折叠得到的 $k$ 阶复残差（用 $\mathrm{d}\theta$ 加权，整转折叠才精确）；
@@ -122,7 +122,7 @@ $$
 
 **③ 软启动**：进 TOP 后 0.15 s 内把整段前馈线性拉起，消除 0.3 到 0.5 N·m 的力矩阶跃。
 
-实测（TOP 稳态 47 s）：锁相方差占比从 $35.9\%$ 降到 $0.3\%$；
+实测（TOP 稳态 47 s）：锁相方差占比从 35.9% 降到 0.3%；
 各阶残差 $1\times/2\times/3\times/4\times$ 从 $0.059/0.105/0.052/0.044^{\circ}$ 降到 $0.003/0.002/0.001/0.004^{\circ}$；
 进 TOP 瞬态 $\max\left|e\right|$ 从 $4.4^{\circ}$ 降到 $2.3^{\circ}$，误差包络进入 $0.5^{\circ}$ 以内约 2 s。
 
@@ -158,7 +158,7 @@ $$
 四轮按 45 度全向轮（与麦克纳姆轮共用同一套反解）解算：
 
 $$
-\omega_i=\frac{\sqrt{2}\left(\pm v_x\pm v_y\right)-L\,\omega_z}{R},
+\omega_i=\frac{\sqrt{2}\left(\pm v_x\pm v_y\right)-L\omega_z}{R},
 \qquad i=1,\dots,4
 $$
 
@@ -170,10 +170,9 @@ $R=0.076\ \mathrm{m}$（固件标定值，已把全向轮的 $\sqrt{2}$ 等效�
 TOP 模式下底盘持续自转，操作手给的前后左右是在**云台坐标系**里的，因此先旋转到车体系：
 
 $$
-\begin{aligned}
-v_x &= \cos\theta_{rel}\,v_x^{rc}+\sin\theta_{rel}\,v_y^{rc}\\
-v_y &= -\left(-\sin\theta_{rel}\,v_x^{rc}+\cos\theta_{rel}\,v_y^{rc}\right)
-\end{aligned}
+v_x = \cos\theta_{rel}\ v_x^{rc}+\sin\theta_{rel}\ v_y^{rc},
+\qquad
+v_y = -\left(-\sin\theta_{rel}\ v_x^{rc}+\cos\theta_{rel}\ v_y^{rc}\right)
 $$
 
 $\theta_{rel}$ 是云台与底盘的相对角。因为电控与机械都有延迟（实测 45 到 65 ms 量级），
